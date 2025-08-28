@@ -245,11 +245,14 @@ const Toast = ({ show, children }) => (
 
 /* ==== Main Page ==== */
 const ChatPage = () => {
+  const CHAT_SERVICE_BASE = "http://localhost:5002"
   const [messages, setMessages] = useState([])
   const [text, setText] = useState('')
   const [mediaPreview, setMediaPreview] = useState(null)
   const [mediaFile, setMediaFile] = useState(null)
   const [recording, setRecording] = useState(false)
+  // Ensure user is defined to avoid ReferenceError in sendMessage
+  const [user, setUser] = useState(null)
 
   const barRef = useRef(null)
   const barInnerRef = useRef(null)
@@ -259,6 +262,11 @@ const ChatPage = () => {
   const [copiedId, setCopiedId] = useState(null)
   const [streamingText, setStreamingText] = useState('')
   const [isStreaming, setIsStreaming] = useState(false)
+  const [historyCursor, setHistoryCursor] = useState(null)
+  const [loadingHistory, setLoadingHistory] = useState(false)
+  const [hasMore, setHasMore] = useState(true)
+  const [chatActivated, setChatActivated] = useState(false)
+  const [historyBuffer, setHistoryBuffer] = useState([])
 
   // Lightbox
   const [lightboxOpen, setLightboxOpen] = useState(false)
@@ -266,6 +274,9 @@ const ChatPage = () => {
 
   // ---- Anchor & scroll helpers ----
   const anchorMsgIdRef = useRef(null)
+  const messagesListRef = useRef(null)
+  const topSentinelRef = useRef(null)
+  const inFlightCursorRef = useRef(null)
   const scrollToMsgById = (id, behavior = 'smooth', offset = 16) => {
     const el = document.querySelector(`[data-mid="${id}"]`)
     if (!el) return
@@ -287,6 +298,101 @@ const ChatPage = () => {
     return () => { ro.disconnect(); window.removeEventListener('resize', update) }
   }, [])
 
+  // History helpers
+  const mapItemToMessage = (d) => ({
+    id: d.message_id || d.id || Date.now(),
+    role: d.role === 'assistant' ? 'assistant' : 'user',
+    text: d.content || '',
+  })
+
+  const fetchHistory = async (cursor = null, toBuffer = false) => {
+    if (!user?.id || loadingHistory) return
+    if (cursor && inFlightCursorRef.current === cursor) return
+    setLoadingHistory(true)
+    inFlightCursorRef.current = cursor || '__initial__'
+    try {
+      const url = new URL(`/v1/conversation/${encodeURIComponent(user.id)}`, CHAT_SERVICE_BASE)
+      url.searchParams.set('page_size', '10')
+      if (cursor) url.searchParams.set('cursor', cursor)
+      const res = await fetch(url.toString())
+      if (!res.ok) throw new Error('history fetch failed')
+      const j = await res.json()
+      const items = Array.isArray(j?.items) ? j.items : []
+      const ascending = [...items].reverse().map(mapItemToMessage)
+
+      if (!chatActivated && !cursor) {
+        // Only buffer initial history; do not render yet
+        setHistoryBuffer(ascending)
+      } else if (cursor) {
+        const listEl = messagesListRef.current
+        const prevHeight = listEl ? listEl.scrollHeight : document.documentElement.scrollHeight
+        setMessages((m) => [...ascending, ...m])
+        setTimeout(() => {
+          const newHeight = listEl ? listEl.scrollHeight : document.documentElement.scrollHeight
+          if (listEl) {
+            listEl.scrollTop = newHeight - prevHeight
+          } else {
+            window.scrollBy(0, newHeight - prevHeight)
+          }
+        }, 0)
+      } else {
+        setMessages(ascending)
+        setTimeout(() => {
+          if (messagesListRef.current) {
+            messagesListRef.current.scrollTop = messagesListRef.current.scrollHeight
+          }
+        }, 0)
+      }
+
+      setHistoryCursor(j?.next_cursor || null)
+      setHasMore(Boolean(j?.next_cursor))
+    } catch (_) {
+    } finally {
+      setLoadingHistory(false)
+      inFlightCursorRef.current = null
+    }
+  }
+
+  useEffect(() => {
+    if (user?.id) fetchHistory(null, true) // prefetch into buffer only
+    // eslint-disable-next-line
+  }, [user?.id])
+
+  const onHistoryScroll = (e) => {
+    if (!chatActivated) return
+    const el = e.currentTarget
+    if (el.scrollTop <= 100 && historyCursor && !loadingHistory) {
+      fetchHistory(historyCursor)
+    }
+  }
+
+  // Also observe window scroll for cases when body is the scroller
+  useEffect(() => {
+    const onWinScroll = () => {
+      if (!chatActivated) return
+      const top = Math.min(document.documentElement.scrollTop || 0, window.scrollY || 0)
+      if (top <= 100 && historyCursor && !loadingHistory) {
+        fetchHistory(historyCursor)
+      }
+    }
+    window.addEventListener('scroll', onWinScroll, { passive: true })
+    return () => window.removeEventListener('scroll', onWinScroll)
+  }, [chatActivated, historyCursor, loadingHistory])
+
+  // IntersectionObserver to reliably detect when top enters viewport
+  useEffect(() => {
+    if (!topSentinelRef.current) return
+    const observer = new IntersectionObserver((entries) => {
+      const entry = entries[0]
+      if (!chatActivated) return
+      if (entry.isIntersecting && historyCursor && !loadingHistory) {
+        fetchHistory(historyCursor)
+      }
+    }, { root: null, rootMargin: '0px', threshold: 0 })
+    observer.observe(topSentinelRef.current)
+    return () => observer.disconnect()
+  }, [chatActivated, historyCursor, loadingHistory])
+
   useEffect(() => {
     const el = barInnerRef.current; if (!el) return
     const compute = () => {
@@ -300,6 +406,18 @@ const ChatPage = () => {
     ro.observe(el)
     window.addEventListener('resize', compute)
     return () => { ro.disconnect(); window.removeEventListener('resize', compute) }
+  }, [])
+
+  // Load current user info (best-effort)
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/v1/users/me', { credentials: 'include' })
+        if (!res.ok) return
+        const j = await res.json()
+        setUser(j?.data || null)
+      } catch (_) {}
+    })()
   }, [])
 
   /* ==== Copy/Rate ==== */
@@ -334,7 +452,13 @@ const ChatPage = () => {
     const userAnchorId = newMsgs[newMsgs.length - 1].id
     anchorMsgIdRef.current = userAnchorId
 
-    setMessages(m => m.concat(newMsgs))
+    if (!chatActivated) {
+      setMessages(() => historyBuffer.concat(newMsgs))
+      setChatActivated(true)
+      setHistoryBuffer([])
+    } else {
+      setMessages(m => m.concat(newMsgs))
+    }
     setText('')
     setMediaPreview(null)
     setMediaFile(null)
@@ -351,18 +475,25 @@ const ChatPage = () => {
 
     try {
       // Use regular chat endpoint for faster response
-      const res = await fetch('/api/v1/chat/chat', {
+      const CHAT_SERVICE_BASE = "http://localhost:5002"
+      const res = await fetch(`${CHAT_SERVICE_BASE}/v1/letta/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ content: text || '[media]' }),
+        // credentials removed to satisfy CORS when allow_origins is "*"
+        body: JSON.stringify({
+          //  content: text || '[media]' 
+            user_id: user?.id ?? null,
+            username: user?.name ?? 'Guest',
+            message: text || '[media]'
+
+          }),
       })
 
       if (!res.ok) throw new Error('Network response was not ok')
       
       const j = await res.json()
       const fullReply = j?.message || 'Chào bạn! Bạn muốn hỏi thêm gì về Emostagram?'
-      const genTimeSec = j?.data?.gen_time_sec
+      const genTimeSec = j?.gen_time_sec
       
       // Fake streaming effect - show text word by word
       const words = fullReply.split(' ')
@@ -438,7 +569,7 @@ const ChatPage = () => {
     e.target.value = ""
   }
 
-  const showHero = messages.length === 0
+  const showHero = !chatActivated
 
   return (
     <main style={{ minHeight: '100vh', background: '#f8fafc', color: '#111827' }}>
@@ -539,6 +670,7 @@ const ChatPage = () => {
           <>
             {/* Messages list */}
             <div
+              ref={messagesListRef}
               style={{
                 display: 'grid',
                 gap: 6,
@@ -548,7 +680,27 @@ const ChatPage = () => {
                 margin: 0,
                 paddingBottom: `calc(${bottomPad}px + env(safe-area-inset-bottom, 0px))`
               }}
+              onScroll={onHistoryScroll}
             >
+              <div ref={topSentinelRef} style={{ height: 1 }} />
+              {chatActivated && historyCursor && (
+                <div style={{ display: 'grid', justifyItems: 'center', margin: '8px 0' }}>
+                  <button
+                    onClick={() => fetchHistory(historyCursor)}
+                    style={{
+                      padding: '6px 10px',
+                      borderRadius: 10,
+                      border: '1px solid #e5e7eb',
+                      background: '#fff',
+                      color: '#6b7280',
+                      cursor: loadingHistory ? 'not-allowed' : 'pointer'
+                    }}
+                    disabled={loadingHistory}
+                  >
+                    {loadingHistory ? 'Loading…' : 'Load earlier messages'}
+                  </button>
+                </div>
+              )}
               {messages.map((m) => {
                 const rated = ratings[m.id]
                 return (
